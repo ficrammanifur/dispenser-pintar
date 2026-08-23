@@ -1,0 +1,408 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ============================================================
+//  KONFIGURASI JARINGAN
+// ============================================================
+const char* WIFI_SSID = "BOLTSuper4G-CC06";
+const char* WIFI_PASS = "d5ddyrqd";
+
+const char* MQTT_HOST = "192.168.8.104";
+const int   MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+const char* MQTT_ID = "refillx-esp32";
+
+// MQTT Topics
+const char* TOPIC_COMMAND   = "refillx/command";
+const char* TOPIC_TELEMETRY = "refillx/telemetry";
+const char* TOPIC_STATUS    = "refillx/status";
+
+// ============================================================
+//  PIN DEFINISI (TANPA SENSOR)
+// ============================================================
+#define PUMP1_PIN  15
+#define VALVE1_PIN 5
+#define PUMP2_PIN  2
+#define VALVE2_PIN 18
+#define PUMP3_PIN  27
+#define VALVE3_PIN 19
+
+// ============================================================
+//  KONFIGURASI TIMER
+// ============================================================
+// 200ml = 10 detik, 500ml = 25 detik
+const float VOLUME_PER_SECOND = 20.0;  // 20ml per detik
+
+// ============================================================
+//  OBJEK & STATE GLOBAL
+// ============================================================
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+bool  lineActive[3]    = {false, false, false};
+int   targetVolumeMl = 0;
+int   currentLine = -1;
+bool  isFilling = false;
+unsigned long fillStartTime = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastReconnect = 0;
+unsigned long lastHeartbeat = 0;
+long  cmdCount = 0;
+float currentVolume = 0;
+
+int pumpPins[3]  = {PUMP1_PIN, PUMP2_PIN, PUMP3_PIN};
+int valvePins[3] = {VALVE1_PIN, VALVE2_PIN, VALVE3_PIN};
+
+const String lineName[3] = {"Line 1", "Line 2", "Line 3"};
+
+// ============================================================
+//  FUNGSI AKTUATOR
+// ============================================================
+bool adaLineAktif() {
+  for (int i = 0; i < 3; i++) if (lineActive[i]) return true;
+  return false;
+}
+
+void allActuatorsOff() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(pumpPins[i], LOW);
+    digitalWrite(valvePins[i], LOW);
+    lineActive[i] = false;
+  }
+  isFilling = false;
+  currentLine = -1;
+  targetVolumeMl = 0;
+  currentVolume = 0;
+  Serial.println(">> SEMUA AKTUATOR OFF");
+}
+
+void bukaLine(int line) {
+  if (line < 0 || line > 2) {
+    Serial.println("[ERR] Line invalid!");
+    return;
+  }
+  
+  Serial.print(">> BUKA "); Serial.println(lineName[line]);
+  digitalWrite(valvePins[line], HIGH);
+  delay(150);
+  digitalWrite(pumpPins[line], HIGH);
+  lineActive[line] = true;
+}
+
+void tutupLine(int line) {
+  if (line < 0 || line > 2) {
+    Serial.println("[ERR] Line invalid!");
+    return;
+  }
+  
+  Serial.print(">> TUTUP "); Serial.println(lineName[line]);
+  digitalWrite(pumpPins[line], LOW);
+  digitalWrite(valvePins[line], LOW);
+  lineActive[line] = false;
+}
+
+// ============================================================
+//  🔥 CEK PENGISIAN SELESAI (PAKAI TIMER)
+// ============================================================
+void cekPengisianSelesai() {
+  if (!isFilling || currentLine == -1) return;
+  
+  // Hitung volume berdasarkan waktu (20ml/detik)
+  unsigned long elapsed = millis() - fillStartTime;
+  float volume = (elapsed / 1000.0) * VOLUME_PER_SECOND;
+  currentVolume = volume;
+  
+  // Progress
+  int progress = (int)((volume / targetVolumeMl) * 100);
+  if (progress > 100) progress = 100;
+  
+  // Kirim progress setiap 200ms
+  if (millis() - lastTelemetry > 200) {
+    lastTelemetry = millis();
+    
+    StaticJsonDocument<256> doc;
+    doc["volume"] = volume;
+    doc["target_ml"] = targetVolumeMl;
+    doc["progress"] = progress;
+    doc["is_filling"] = isFilling;
+    doc["line_active"] = currentLine + 1;
+    doc["elapsed"] = elapsed / 1000.0;
+    
+    char buf[256];
+    size_t n = serializeJson(doc, buf);
+    if (mqtt.connected()) {
+      mqtt.publish(TOPIC_TELEMETRY, buf, n);
+    }
+  }
+  
+  // 🔥 CEK APAKAH VOLUME TERCAPAI
+  if (volume >= targetVolumeMl) {
+    Serial.println("========================================");
+    Serial.println("✅ PENGISIAN SELESAI!");
+    Serial.print("   Target: "); Serial.print(targetVolumeMl); Serial.println(" ml");
+    Serial.print("   Waktu : "); Serial.print(elapsed / 1000.0); Serial.println(" detik");
+    Serial.println("========================================");
+    
+    tutupLine(currentLine);
+    isFilling = false;
+    mqtt.publish(TOPIC_STATUS, "done", true);
+    
+    currentLine = -1;
+    targetVolumeMl = 0;
+    currentVolume = 0;
+  }
+  
+  // 🔥 SAFETY TIMEOUT 60 DETIK
+  if (elapsed > 60000) {
+    Serial.println("========================================");
+    Serial.println("⏰ TIMEOUT! Pengisian dihentikan");
+    Serial.println("========================================");
+    tutupLine(currentLine);
+    isFilling = false;
+    currentLine = -1;
+    targetVolumeMl = 0;
+    currentVolume = 0;
+    mqtt.publish(TOPIC_STATUS, "timeout", true);
+  }
+}
+
+// ============================================================
+//  🔥 PROSES PERINTAH DARI main.py
+// ============================================================
+void prosesPerintah(const char* payload, unsigned int len) {
+  cmdCount++;
+
+  StaticJsonDocument<256> cmd;
+  DeserializationError err = deserializeJson(cmd, payload, len);
+  
+  if (err) {
+    Serial.print("[ERR] JSON: ");
+    Serial.println(err.c_str());
+    return;
+  }
+  
+  if (!cmd.containsKey("action")) {
+    Serial.println("[ERR] No 'action' key");
+    return;
+  }
+
+  String action = cmd["action"].as<String>();
+  int line = cmd["line"] | -1;
+  int volume = cmd["volume"] | 0;
+
+  Serial.println("========================================");
+  Serial.println("📩 COMMAND RECEIVED!");
+  Serial.print("   Action : "); Serial.println(action);
+  Serial.print("   Line   : "); Serial.println(line);
+  Serial.print("   Volume : "); Serial.println(volume);
+  Serial.println("========================================");
+
+  if (action == "open") {
+    // CEK SEDANG FILLING
+    if (isFilling) {
+      Serial.println("⚠️ Sedang mengisi, skip command");
+      return;
+    }
+    
+    // MULAI PENGISIAN
+    if (line >= 0 && line <= 2) {
+      targetVolumeMl = volume;
+      currentLine = line;
+      isFilling = true;
+      currentVolume = 0;
+      fillStartTime = millis();
+      
+      // Hitung estimasi waktu
+      float estimatedTime = volume / VOLUME_PER_SECOND;
+      
+      Serial.println("✅ MULAI PENGISIAN!");
+      Serial.print("   Target: "); Serial.print(targetVolumeMl); Serial.println(" ml");
+      Serial.print("   Line  : "); Serial.println(lineName[line]);
+      Serial.print("   Estimasi: "); Serial.print(estimatedTime); Serial.println(" detik");
+      Serial.println("========================================");
+      
+      bukaLine(line);
+      mqtt.publish(TOPIC_STATUS, "filling", true);
+    }
+  }
+  else if (action == "close") {
+    if (line >= 0 && line <= 2) {
+      tutupLine(line);
+      if (currentLine == line) {
+        isFilling = false;
+        currentLine = -1;
+        targetVolumeMl = 0;
+        currentVolume = 0;
+      }
+      mqtt.publish(TOPIC_STATUS, "stopped", true);
+    }
+  }
+  else if (action == "stop_all") {
+    allActuatorsOff();
+    mqtt.publish(TOPIC_STATUS, "stopped", true);
+  }
+  else {
+    Serial.print("[ERR] Unknown action: ");
+    Serial.println(action);
+  }
+}
+
+// ============================================================
+//  CALLBACK MQTT
+// ============================================================
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  Serial.print("[RX] "); Serial.print(topic);
+  Serial.print(": ");
+  for (unsigned int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+  
+  if (strcmp(topic, TOPIC_COMMAND) == 0) {
+    prosesPerintah((const char*)payload, length);
+  }
+}
+
+// ============================================================
+//  KONEKSI
+// ============================================================
+void sambungWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("[WiFi] FAILED");
+  }
+}
+
+bool sambungMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  Serial.print("[MQTT] Connecting to ");
+  Serial.print(MQTT_HOST);
+  Serial.print(":"); Serial.println(MQTT_PORT);
+
+  bool ok = mqtt.connect(MQTT_ID);
+
+  if (ok) {
+    Serial.println("[MQTT] Connected!");
+    mqtt.publish(TOPIC_STATUS, "online", true);
+    mqtt.subscribe(TOPIC_COMMAND);
+    Serial.print("[MQTT] Subscribed: ");
+    Serial.println(TOPIC_COMMAND);
+  } else {
+    Serial.print("[MQTT] Failed, rc=");
+    Serial.println(mqtt.state());
+  }
+  return ok;
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("   REFILLX ESP32 - SIMPLE TIMER");
+  Serial.println("   Tanpa Sensor (HX711 & ToF)");
+  Serial.println("==========================================");
+
+  // Setup aktuator
+  for (int i = 0; i < 3; i++) {
+    pinMode(pumpPins[i], OUTPUT);
+    pinMode(valvePins[i], OUTPUT);
+    digitalWrite(pumpPins[i], LOW);
+    digitalWrite(valvePins[i], LOW);
+  }
+  Serial.println("[1/3] Aktuator OK");
+
+  // Koneksi
+  Serial.println("[2/3] Koneksi WiFi...");
+  sambungWiFi();
+
+  Serial.println("[3/3] Koneksi MQTT...");
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
+  mqtt.setBufferSize(512);
+  mqtt.setKeepAlive(15);
+  sambungMQTT();
+
+  Serial.println("==========================================");
+  Serial.println("✅ SISTEM SIAP!");
+  Serial.println("   - 200ml = 10 detik");
+  Serial.println("   - 500ml = 25 detik");
+  Serial.println("   Menunggu command dari main.py...");
+  Serial.println("==========================================");
+  Serial.println();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  // Jaga koneksi
+  if (WiFi.status() != WL_CONNECTED) {
+    if (adaLineAktif()) allActuatorsOff();
+    if (millis() - lastReconnect > 5000) {
+      lastReconnect = millis();
+      sambungWiFi();
+    }
+  }
+  else if (!mqtt.connected()) {
+    if (adaLineAktif()) allActuatorsOff();
+    if (millis() - lastReconnect > 3000) {
+      lastReconnect = millis();
+      sambungMQTT();
+    }
+  }
+  else {
+    mqtt.loop();
+  }
+
+  // Cek pengisian selesai (timer)
+  cekPengisianSelesai();
+
+  // Kirim status online setiap 10 detik
+  if (millis() - lastHeartbeat > 10000) {
+    lastHeartbeat = millis();
+    if (mqtt.connected()) {
+      mqtt.publish(TOPIC_STATUS, "online", true);
+    }
+  }
+
+  // Heartbeat di Serial Monitor
+  if (millis() - lastTelemetry > 1000) {
+    if (isFilling) {
+      int progress = (int)((currentVolume / targetVolumeMl) * 100);
+      if (progress > 100) progress = 100;
+      Serial.print("[HB] ");
+      Serial.print("Volume: "); Serial.print(currentVolume, 1); Serial.print("ml");
+      Serial.print(" | Target: "); Serial.print(targetVolumeMl); Serial.print("ml");
+      Serial.print(" | Progress: "); Serial.print(progress); Serial.print("%");
+      Serial.print(" | Act: ");
+      for (int i = 0; i < 3; i++) Serial.print(lineActive[i] ? "1" : "0");
+      Serial.println();
+    }
+  }
+
+  delay(20);
+}
