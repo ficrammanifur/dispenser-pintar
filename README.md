@@ -145,10 +145,10 @@ LOCAL_PORT = 1883
 
 ### Remote MQTT (Midtrans Payment)
 ```python
-REMOTE_BROKER = "103.168.146.179"
+REMOTE_BROKER = ""
 REMOTE_PORT = 1883
-REMOTE_USERNAME = "refillx"
-REMOTE_PASSWORD = "Password1!"
+REMOTE_USERNAME = ""
+REMOTE_PASSWORD = ""
 ```
 
 ### Pemetaan Produk
