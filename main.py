@@ -26,10 +26,10 @@ LOCAL_BROKER = "127.0.0.1"
 LOCAL_PORT = 1883
 
 # REMOTE MQTT (untuk payment dari Midtrans)
-REMOTE_BROKER = "103.168.146.179"
+REMOTE_BROKER = ""
 REMOTE_PORT = 1883
-REMOTE_USERNAME = "refillx"
-REMOTE_PASSWORD = "Password1!"
+REMOTE_USERNAME = ""
+REMOTE_PASSWORD = ""
 
 # Topics
 TOPIC_SUCCESS = "success"              # Dari remote broker (payment)
